@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "os_port.h"
 #include "ssl.h"
 
 /* The session expiry time */
@@ -47,7 +48,7 @@ static const char * server_finished = "server finished";
 static const char * client_finished = "client finished";
 
 static int do_handshake(SSL *ssl, uint8_t *buf, int read_len);
-static void set_key_block(SSL *ssl, int is_write);
+static int set_key_block(SSL *ssl, int is_write);
 static int verify_digest(SSL *ssl, int mode, const uint8_t *buf, int read_len);
 static void *crypt_new(SSL *ssl, uint8_t *key, uint8_t *iv, int is_decrypt);
 static int send_raw_packet(SSL *ssl, uint8_t protocol);
@@ -245,8 +246,10 @@ EXP_FUNC void STDCALL ssl_free(SSL *ssl)
     if (ssl == NULL)        /* just ignore null pointers */
         return;
 
-    /* spec says we must notify when we are dying */
-    send_alert(ssl, SSL_ALERT_CLOSE_NOTIFY);
+    /* only notify if we weren't notified first */
+    if (!IS_SET_SSL_FLAG(SSL_RECEIVED_CLOSE_NOTIFY))
+      /* spec says we must notify when we are dying */
+      send_alert(ssl, SSL_ALERT_CLOSE_NOTIFY);
 
     ssl_ctx = ssl->ssl_ctx;
 
@@ -284,7 +287,8 @@ EXP_FUNC int STDCALL ssl_read(SSL *ssl, uint8_t **in_data)
     int ret = basic_read(ssl, in_data);
 
     /* check for return code so we can send an alert */
-    if (ret < SSL_OK)
+
+    if (ret < SSL_OK && ret != SSL_CLOSE_NOTIFY)
     {
         if (ret != SSL_ERROR_CONN_LOST)
         {
@@ -344,8 +348,9 @@ int add_cert(SSL_CTX *ssl_ctx, const uint8_t *buf, int len)
     if (i == CONFIG_SSL_MAX_CERTS) /* too many certs */
     {
 #ifdef CONFIG_SSL_FULL_MODE
-        printf("Error: maximum number of certs added - change of "
-                "compile-time configuration required\n");
+        printf("Error: maximum number of certs added (%d) - change of "
+                "compile-time configuration required\n",
+                CONFIG_SSL_MAX_CERTS);
 #endif
         goto error;
     }
@@ -383,9 +388,8 @@ error:
  */
 int add_cert_auth(SSL_CTX *ssl_ctx, const uint8_t *buf, int len)
 {
-    int ret = SSL_ERROR_NO_CERT_DEFINED;
+    int ret = SSL_OK; /* ignore errors for now */
     int i = 0;
-    int offset;
     CA_CERT_CTX *ca_cert_ctx;
 
     if (ssl_ctx->ca_cert_ctx == NULL)
@@ -396,26 +400,33 @@ int add_cert_auth(SSL_CTX *ssl_ctx, const uint8_t *buf, int len)
     while (i < CONFIG_X509_MAX_CA_CERTS && ca_cert_ctx->cert[i]) 
         i++;
 
-    if (i > CONFIG_X509_MAX_CA_CERTS)
+    while (len > 0)
     {
+        int offset;
+        if (i >= CONFIG_X509_MAX_CA_CERTS)
+        {
 #ifdef CONFIG_SSL_FULL_MODE
-        printf("Error: maximum number of CA certs added - change of "
-                "compile-time configuration required\n");
+            printf("Error: maximum number of CA certs added (%d) - change of "
+                    "compile-time configuration required\n", 
+                    CONFIG_X509_MAX_CA_CERTS);
 #endif
-        goto error;
+            break;
+        }
+
+
+        /* ignore the return code */
+        if (x509_new(buf, &offset, &ca_cert_ctx->cert[i]) == X509_OK)
+        {
+#if defined (CONFIG_SSL_FULL_MODE)
+            if (ssl_ctx->options & SSL_DISPLAY_CERTS)
+                x509_print(ca_cert_ctx->cert[i], NULL);
+#endif
+        }
+
+        i++;
+        len -= offset;
     }
 
-    if ((ret = x509_new(buf, &offset, &ca_cert_ctx->cert[i])))
-        goto error;
-
-    len -= offset;
-    ret = SSL_OK;           /* ok so far */
-
-    /* recurse? */
-    if (len > 0)
-        ret = add_cert_auth(ssl_ctx, &buf[offset], len);
-
-error:
     return ret;
 }
 
@@ -452,7 +463,27 @@ EXP_FUNC const char * STDCALL ssl_get_cert_dn(const SSL *ssl, int component)
     }
 }
 
-#endif
+/*
+ * Retrieve a "Subject Alternative Name" from a v3 certificate
+ */
+EXP_FUNC const char * STDCALL ssl_get_cert_subject_alt_dnsname(const SSL *ssl,
+        int dnsindex)
+{
+    int i;
+
+    if (ssl->x509_ctx == NULL || ssl->x509_ctx->subject_alt_dnsnames == NULL)
+        return NULL;
+
+    for (i = 0; i < dnsindex; ++i)
+    {
+        if (ssl->x509_ctx->subject_alt_dnsnames[i] == NULL)
+            return NULL;
+    }
+
+    return ssl->x509_ctx->subject_alt_dnsnames[dnsindex];
+}
+
+#endif /* CONFIG_SSL_CERT_VERIFICATION */
 
 /*
  * Find an ssl object based on the client's file descriptor.
@@ -879,7 +910,6 @@ static void *crypt_new(SSL *ssl, uint8_t *key, uint8_t *iv, int is_decrypt)
 
                 return (void *)aes_ctx;
             }
-            break;
 
         case SSL_RC4_128_MD5:
 #endif
@@ -889,7 +919,6 @@ static void *crypt_new(SSL *ssl, uint8_t *key, uint8_t *iv, int is_decrypt)
                 RC4_setup(rc4_ctx, key, 16);
                 return (void *)rc4_ctx;
             }
-            break;
     }
 
     return NULL;    /* its all gone wrong */
@@ -916,14 +945,21 @@ static int send_raw_packet(SSL *ssl, uint8_t protocol)
 
     while (sent < pkt_size)
     {
-        if ((ret = SOCKET_WRITE(ssl->client_fd, 
-                        &ssl->bm_all_data[sent], pkt_size)) < 0)
-        {
-            ret = SSL_ERROR_CONN_LOST;
-            break;
-        }
+        ret = SOCKET_WRITE(ssl->client_fd, 
+                        &ssl->bm_all_data[sent], pkt_size);
 
-        sent += ret;
+        if (ret >= 0)
+            sent += ret;
+        else
+        {
+
+#ifdef WIN32
+            if (GetLastError() != WSAEWOULDBLOCK)
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+#endif
+                return SSL_ERROR_CONN_LOST;
+        }
 
         /* keep going until the write buffer has some space */
         if (sent != pkt_size)
@@ -932,11 +968,9 @@ static int send_raw_packet(SSL *ssl, uint8_t protocol)
             FD_ZERO(&wfds);
             FD_SET(ssl->client_fd, &wfds);
 
+            /* block and wait for it */
             if (select(ssl->client_fd + 1, NULL, &wfds, NULL, NULL) < 0)
-            {
-                ret = SSL_ERROR_CONN_LOST;
-                break;
-            }
+                return SSL_ERROR_CONN_LOST;
         }
     }
 
@@ -1040,13 +1074,16 @@ int send_packet(SSL *ssl, uint8_t protocol, const uint8_t *in, int length)
  * Work out the cipher keys we are going to use for this session based on the
  * master secret.
  */
-static void set_key_block(SSL *ssl, int is_write)
+static int set_key_block(SSL *ssl, int is_write)
 {
     const cipher_info_t *ciph_info = get_cipher_info(ssl->cipher);
     uint8_t *q;
     uint8_t client_key[32], server_key[32]; /* big enough for AES256 */
     uint8_t client_iv[16], server_iv[16];   /* big enough for AES128/256 */
     int is_client = IS_SET_SSL_FLAG(SSL_IS_CLIENT);
+
+    if (ciph_info == NULL)
+        return -1;
 
     /* only do once in a handshake */
     if (ssl->dc->key_block == NULL)
@@ -1119,6 +1156,7 @@ static void set_key_block(SSL *ssl, int is_write)
     }
 
     ssl->cipher_info = ciph_info;
+    return 0;
 }
 
 /**
@@ -1132,6 +1170,16 @@ int basic_read(SSL *ssl, uint8_t **in_data)
 
     read_len = SOCKET_READ(ssl->client_fd, &buf[ssl->bm_read_index], 
                             ssl->need_bytes-ssl->got_bytes);
+
+    if (read_len < 0) 
+    {
+#ifdef WIN32
+        if (GetLastError() == WSAEWOULDBLOCK)
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+#endif
+            return 0;
+    }
 
     /* connection has gone, so die */
     if (read_len <= 0)
@@ -1211,8 +1259,16 @@ int basic_read(SSL *ssl, uint8_t **in_data)
     switch (ssl->record_type)
     {
         case PT_HANDSHAKE_PROTOCOL:
-            ssl->dc->bm_proc_index = 0;
-            ret = do_handshake(ssl, buf, read_len);
+            if (ssl->dc != NULL)
+            {
+                ssl->dc->bm_proc_index = 0;
+                ret = do_handshake(ssl, buf, read_len);
+            }
+            else /* no client renegotiation allowed */
+            {
+                ret = SSL_ERROR_NO_CLIENT_RENOG;              
+                goto error;
+            }
             break;
 
         case PT_CHANGE_CIPHER_SPEC:
@@ -1224,7 +1280,12 @@ int basic_read(SSL *ssl, uint8_t **in_data)
 
             /* all encrypted from now on */
             SET_SSL_FLAG(SSL_RX_ENCRYPTED);
-            set_key_block(ssl, 0);
+            if (set_key_block(ssl, 0) < 0)
+            {
+                ret = SSL_ERROR_INVALID_HANDSHAKE;
+                goto error;
+            }
+            
             memset(ssl->read_sequence, 0, 8);
             break;
 
@@ -1240,7 +1301,15 @@ int basic_read(SSL *ssl, uint8_t **in_data)
 
         case PT_ALERT_PROTOCOL:
             /* return the alert # with alert bit set */
-            ret = -buf[1]; 
+            if(buf[0] == SSL_ALERT_TYPE_WARNING &&
+               buf[1] == SSL_ALERT_CLOSE_NOTIFY)
+            {
+              ret = SSL_CLOSE_NOTIFY;
+              SET_SSL_FLAG(SSL_RECEIVED_CLOSE_NOTIFY);
+            }
+            else 
+                ret = -buf[1]; 
+
             DISPLAY_ALERT(ssl, buf[1]);
             break;
 
@@ -1314,7 +1383,10 @@ int send_change_cipher_spec(SSL *ssl)
     int ret = send_packet(ssl, PT_CHANGE_CIPHER_SPEC, 
             g_chg_cipher_spec_pkt, sizeof(g_chg_cipher_spec_pkt));
     SET_SSL_FLAG(SSL_TX_ENCRYPTED);
-    set_key_block(ssl, 1);
+
+    if (ret >= 0 && set_key_block(ssl, 1) < 0)
+        ret = SSL_ERROR_INVALID_HANDSHAKE;
+
     memset(ssl->write_sequence, 0, 8);
     return ret;
 }
@@ -1403,6 +1475,10 @@ int send_alert(SSL *ssl, int error_code)
 
         case SSL_ERROR_BAD_CERTIFICATE:
             alert_num = SSL_ALERT_BAD_CERTIFICATE;
+            break;
+
+        case SSL_ERROR_NO_CLIENT_RENOG:
+            alert_num = SSL_ALERT_NO_RENEGOTIATION;
             break;
 
         default:
@@ -1505,7 +1581,7 @@ void disposable_free(SSL *ssl)
 {
     if (ssl->dc)
     {
-	    free(ssl->dc->key_block);
+        free(ssl->dc->key_block);
         memset(ssl->dc, 0, sizeof(DISPOSABLE_CTX));
         free(ssl->dc);
         ssl->dc = NULL;
@@ -1582,9 +1658,13 @@ SSL_SESSION *ssl_session_update(int max_sessions, SSL_SESSION *ssl_sessions[],
     }
 
     /* ok, we've used up all of our sessions. So blow the oldest session away */
-    oldest_sess->conn_time = tm;
-    memset(oldest_sess->session_id, 0, sizeof(SSL_SESSION_ID_SIZE));
-    memset(oldest_sess->master_secret, 0, sizeof(SSL_SECRET_SIZE));
+    if (oldest_sess != NULL)
+    {
+        oldest_sess->conn_time = tm;
+        memset(oldest_sess->session_id, 0, sizeof(SSL_SESSION_ID_SIZE));
+        memset(oldest_sess->master_secret, 0, sizeof(SSL_SECRET_SIZE));
+    }
+
     SSL_CTX_UNLOCK(ssl->ssl_ctx->mutex);
     return oldest_sess;
 }
@@ -1734,7 +1814,6 @@ int process_certificate(SSL *ssl, X509_CTX **x509_ctx)
             goto error;
         }
 
-        /* DISPLAY_CERT(ssl, *chain); */
         chain = &((*chain)->next);
         offset += cert_size;
     }
@@ -1821,18 +1900,6 @@ void DISPLAY_STATE(SSL *ssl, int is_send, uint8_t state, int not_ok)
     }
 
     printf("%s\n", str);
-    TTY_FLUSH();
-}
-
-/**
- * Debugging routine to display X509 certificates.
- */
-void DISPLAY_CERT(SSL *ssl, const X509_CTX *x509_ctx)
-{
-    if (!IS_SET_SSL_FLAG(SSL_DISPLAY_CERTS))
-        return;
-
-    x509_print(x509_ctx, ssl->ssl_ctx->ca_cert_ctx);
     TTY_FLUSH();
 }
 
@@ -1939,6 +2006,10 @@ EXP_FUNC void STDCALL ssl_display_error(int error_code)
             printf("no certificate defined");
             break;
 
+        case SSL_ERROR_NO_CLIENT_RENOG:
+            printf("client renegotiation not supported");
+            break;
+            
         case SSL_ERROR_NOT_SUPPORTED:
             printf("Option not supported");
             break;
@@ -2000,6 +2071,10 @@ void DISPLAY_ALERT(SSL *ssl, int alert)
             printf("decrypt error");
             break;
 
+        case SSL_ALERT_NO_RENEGOTIATION:
+            printf("no renegotiation");
+            break;
+
         default:
             printf("alert - (unknown %d)", alert);
             break;
@@ -2045,7 +2120,14 @@ EXP_FUNC int STDCALL ssl_verify_cert(const SSL *ssl)
     return -1;
 }
 
+
 EXP_FUNC const char * STDCALL ssl_get_cert_dn(const SSL *ssl, int component)
+{
+    printf(unsupported_str);
+    return NULL;
+}
+
+EXP_FUNC const char * STDCALL ssl_get_cert_subject_alt_dnsname(const SSL *ssl, int index)
 {
     printf(unsupported_str);
     return NULL;

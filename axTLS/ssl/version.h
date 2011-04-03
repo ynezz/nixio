@@ -1,1 +1,1 @@
-#define AXTLS_VERSION    "1.2.1"
+#define AXTLS_VERSION    "1.3.2"

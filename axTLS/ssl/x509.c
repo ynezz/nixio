@@ -113,7 +113,9 @@ int x509_new(const uint8_t *cert, int *len, X509_CTX **ctx)
             asn1_validity(cert, &offset, x509_ctx) ||
             asn1_name(cert, &offset, x509_ctx->cert_dn) ||
             asn1_public_key(cert, &offset, x509_ctx))
+    {
         goto end_cert;
+    }
 
     bi_ctx = x509_ctx->rsa_ctx->bi_ctx;
 
@@ -147,26 +149,73 @@ int x509_new(const uint8_t *cert, int *len, X509_CTX **ctx)
         x509_ctx->digest = bi_import(bi_ctx, md2_dgst, MD2_SIZE);
     }
 
-    offset = end_tbs;   /* skip the v3 data */
+    if (cert[offset] == ASN1_V3_DATA)
+    {
+        int suboffset;
+
+        ++offset;
+        get_asn1_length(cert, &offset);
+
+        if ((suboffset = asn1_find_subjectaltname(cert, offset)) > 0)
+        {
+            if (asn1_next_obj(cert, &suboffset, ASN1_OCTET_STRING) > 0)
+            {
+                int altlen;
+
+                if ((altlen = asn1_next_obj(cert, 
+                                            &suboffset, ASN1_SEQUENCE)) > 0)
+                {
+                    int endalt = suboffset + altlen;
+                    int totalnames = 0;
+
+                    while (suboffset < endalt)
+                    {
+                        int type = cert[suboffset++];
+                        int dnslen = get_asn1_length(cert, &suboffset);
+
+                        if (type == ASN1_CONTEXT_DNSNAME)
+                        {
+                            x509_ctx->subject_alt_dnsnames = (char**)
+                                    realloc(x509_ctx->subject_alt_dnsnames, 
+                                       (totalnames + 2) * sizeof(char*));
+                            x509_ctx->subject_alt_dnsnames[totalnames] = 
+                                    (char*)malloc(dnslen + 1);
+                            x509_ctx->subject_alt_dnsnames[totalnames+1] = NULL;
+                            memcpy(x509_ctx->subject_alt_dnsnames[totalnames], 
+                                    cert + suboffset, dnslen);
+                            x509_ctx->subject_alt_dnsnames[
+                                    totalnames][dnslen] = 0;
+                            ++totalnames;
+                        }
+
+                        suboffset += dnslen;
+                    }
+                }
+            }
+        }
+    }
+
+    offset = end_tbs;   /* skip the rest of v3 data */
     if (asn1_skip_obj(cert, &offset, ASN1_SEQUENCE) || 
             asn1_signature(cert, &offset, x509_ctx))
         goto end_cert;
 #endif
-
+    ret = X509_OK;
+end_cert:
     if (len)
     {
         *len = cert_size;
     }
 
-    ret = X509_OK;
-end_cert:
-
-#ifdef CONFIG_SSL_FULL_MODE
     if (ret)
     {
-        printf("Error: Invalid X509 ASN.1 file\n");
-    }
+#ifdef CONFIG_SSL_FULL_MODE
+        printf("Error: Invalid X509 ASN.1 file (%s)\n",
+                        x509_display_error(ret));
 #endif
+        x509_free(x509_ctx);
+        *ctx = NULL;
+    }
 
     return ret;
 }
@@ -195,10 +244,17 @@ void x509_free(X509_CTX *x509_ctx)
     {
         bi_free(x509_ctx->rsa_ctx->bi_ctx, x509_ctx->digest);
     }
+
+    if (x509_ctx->subject_alt_dnsnames)
+    {
+        for (i = 0; x509_ctx->subject_alt_dnsnames[i]; ++i)
+            free(x509_ctx->subject_alt_dnsnames[i]);
+
+        free(x509_ctx->subject_alt_dnsnames);
+    }
 #endif
 
     RSA_free(x509_ctx->rsa_ctx);
-
     next = x509_ctx->next;
     free(x509_ctx);
     x509_free(next);        /* clear the chain */
@@ -309,7 +365,7 @@ int x509_verify(const CA_CERT_CTX *ca_cert_ctx, const X509_CTX *cert)
        if (ca_cert_ctx != NULL) 
        {
             /* go thu the CA store */
-           while (i < CONFIG_X509_MAX_CA_CERTS && ca_cert_ctx->cert[i])
+            while (i < CONFIG_X509_MAX_CA_CERTS && ca_cert_ctx->cert[i])
             {
                 if (asn1_compare_dn(cert->ca_cert_dn,
                                             ca_cert_ctx->cert[i]->cert_dn) == 0)
@@ -326,7 +382,8 @@ int x509_verify(const CA_CERT_CTX *ca_cert_ctx, const X509_CTX *cert)
             }
         }
 
-       /* couldn't find a trusted cert (& let self-signed errors be returned) */
+        /* couldn't find a trusted cert (& let self-signed errors 
+           be returned) */
         if (!match_ca_cert && !is_self_signed)
         {
             ret = X509_VFY_ERROR_NO_TRUSTED_CERT;       

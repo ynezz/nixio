@@ -28,6 +28,7 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "os_port.h"
 #include "ssl.h"
 
 #define BACKLOG 15
@@ -36,8 +37,10 @@
 #define HAVE_IPV6
 #endif
 
-#define MAXPOSTDATASIZE                     30000
+#define MAXPOSTDATASIZE                     30000 /* adjust for file upload
+                                                     size*/
 #define MAXREQUESTLENGTH                    256
+#define MAXREADLENGTH                       8800  /* FF3=4096, IE7=8760 */
 #define BLOCKSIZE                           4096
 
 #define INITIAL_CONNECTION_SLOTS            10
@@ -82,11 +85,13 @@ struct connstruct
     int numbytes;
     char databuf[BLOCKSIZE];
     uint8_t is_ssl;
+    uint8_t is_v1_0;
     uint8_t close_when_done;
     time_t if_modified_since;
 
 #if defined(CONFIG_HTTP_HAS_CGI)
     uint8_t is_cgi;
+    char cgicontenttype[MAXREQUESTLENGTH];
 #ifdef CONFIG_HTTP_ENABLE_LUA
     uint8_t is_lua;
 #endif

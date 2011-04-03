@@ -47,14 +47,15 @@
 #include <pthread.h>
 #endif
 
+#include "os_port.h"
 #include "ssl.h"
 
 #define DEFAULT_CERT            "../ssl/test/axTLS.x509_512.cer"
 #define DEFAULT_KEY             "../ssl/test/axTLS.key_512"     
 //#define DEFAULT_SVR_OPTION      SSL_DISPLAY_BYTES|SSL_DISPLAY_STATES
 #define DEFAULT_SVR_OPTION      0
-#define DEFAULT_CLNT_OPTION     0
 //#define DEFAULT_CLNT_OPTION      SSL_DISPLAY_BYTES|SSL_DISPLAY_STATES
+#define DEFAULT_CLNT_OPTION     0
 
 static int g_port = 19001;
 
@@ -427,10 +428,12 @@ end:
 static int BIGINT_test(BI_CTX *ctx)
 {
     int res = 1;
+
+#ifndef CONFIG_INTEGER_8BIT 
+#ifndef CONFIG_INTEGER_16BIT 
     bigint *bi_data, *bi_exp, *bi_res;
     const char *expnt, *plaintext, *mod;
     uint8_t compare[MAX_KEY_BYTE_SIZE];
-
     /**
      * 512 bit key
      */
@@ -461,6 +464,32 @@ static int BIGINT_test(BI_CTX *ctx)
     bi_export(ctx, bi_res, compare, 64);
     if (memcmp(plaintext, compare, 64) != 0)
         goto end;
+#endif
+#endif
+
+    /*
+     * Multiply with psssible carry issue (8 bit)
+     */
+    {
+        bigint *bi_x = bi_str_import(ctx, 
+                "AFD5060E224B70DA99EFB385BA5C0D2BEA0AD1DAAA52686E1A02D677BC65C1DA7A496BBDCC02999E8814F10AFC4B8E0DD4E6687E0762CE717A5EA1E452B5C56065C8431F0FB9D23CFF3A4B4149798C0670AF7F9565A0EAE5CF1AB16A1F0C3DD5E485DC5ABB96EBE0B6778A15B7302CBCE358E4BF2E2E30932758AC6EFA9F5828");
+        bigint *arg2 = bi_clone(ctx, bi_x);
+        bigint *arg3 = bi_clone(ctx, bi_x);
+        bigint *sqr_result = bi_square(ctx, bi_x);
+        bigint *mlt_result = bi_multiply(ctx, arg2, arg3);
+
+        if (bi_compare(sqr_result, mlt_result) != 0)
+        {
+            bi_print("SQR_RESULT", sqr_result);
+            bi_print("MLT_RESULT", mlt_result);
+            bi_free(ctx, sqr_result);
+            bi_free(ctx, mlt_result);
+            goto end;
+        }
+
+        bi_free(ctx, sqr_result);
+        bi_free(ctx, mlt_result);
+    }
 
     printf("All BIGINT tests passed\n");
     res = 0;
@@ -486,7 +515,6 @@ static int RSA_test(void)
     bigint *plaintext_bi;
     bigint *enc_data_bi, *dec_data_bi;
     uint8_t enc_data2[128], dec_data2[128];
-    int size;
     int len; 
     uint8_t *buf;
 
@@ -517,7 +545,7 @@ static int RSA_test(void)
     }
 
     RSA_encrypt(rsa_ctx, (const uint8_t *)"abc", 3, enc_data2, 0);
-    size = RSA_decrypt(rsa_ctx, enc_data2, dec_data2, 1);
+    RSA_decrypt(rsa_ctx, enc_data2, dec_data2, 1);
     if (memcmp("abc", dec_data2, 3))
     {
         printf("Error: ENCRYPT/DECRYPT #2 failed\n");
@@ -648,12 +676,40 @@ static int cert_tests(void)
     }
 
     ssl_ctx_free(ssl_ctx);
+
+    if (get_file("../ssl/test/qualityssl.com.der", &buf) < 0 ||
+                                    x509_new(buf, &len, &x509_ctx))
+    {
+        printf("Cert #9\n");
+        res = -1;
+        goto bad_cert;
+    }
+
+    if (strcmp(x509_ctx->subject_alt_dnsnames[1], "qualityssl.com"))
+    {
+        printf("Cert #9 (2)\n");
+        res = -1;
+        goto bad_cert;
+    }
+    x509_free(x509_ctx);
+    free(buf);
+
+    ssl_ctx = ssl_ctx_new(0, 0);
+    if (ssl_obj_load(ssl_ctx, SSL_OBJ_X509_CACERT, 
+            "../ssl/test/ca-bundle.crt", NULL))
+    {
+        printf("Cert #10\n");
+        goto bad_cert;
+    }
+
+    ssl_ctx_free(ssl_ctx);
     res = 0;        /* all ok */
     printf("All Certificate tests passed\n");
 
 bad_cert:
     if (res)
         printf("Error: A certificate test failed\n");
+
     return res;
 }
 
@@ -737,9 +793,7 @@ typedef struct
 static void do_client(client_t *clnt)
 {
     char openssl_buf[2048];
-
-    /* make sure the main thread goes first */
-    sleep(0);
+    usleep(200000);           /* allow server to start */
 
     /* show the session ids in the reconnect test */
     if (strcmp(clnt->testname, "Session Reuse") == 0)
@@ -864,15 +918,16 @@ static int SSL_server_test(
         while ((size = ssl_read(ssl, &read_buf)) == SSL_OK);
         SOCKET_CLOSE(client_fd);
         
-        if (size < SSL_OK) /* got some alert or something nasty */
+        if (size == SSL_CLOSE_NOTIFY)
+        {
+            /* do nothing */ 
+        }
+        else if (size < SSL_OK) /* got some alert or something nasty */
         {
             ret = size;
 
             if (ret == SSL_ERROR_CONN_LOST)
-            {
-                ret = SSL_OK;
                 continue;
-            }
 
             break;  /* we've got a problem */
         }
@@ -960,7 +1015,8 @@ int SSL_server_tests(void)
     /* 
      * 512 bit RSA key 
      */
-    if ((ret = SSL_server_test("512 bit key", "-cipher RC4-SHA", 
+    if ((ret = SSL_server_test("512 bit key", 
+                    "-cipher RC4-SHA", 
                     "../ssl/test/axTLS.x509_512.cer", NULL, 
                     "../ssl/test/axTLS.key_512",
                     NULL, NULL, DEFAULT_SVR_OPTION)))
@@ -970,13 +1026,21 @@ int SSL_server_tests(void)
      * 1024 bit RSA key (check certificate chaining)
      */
     if ((ret = SSL_server_test("1024 bit key", 
-                    "-cipher RC4-SHA", 
-                    "../ssl/test/axTLS.x509_device.cer", 
-                    "../ssl/test/axTLS.x509_512.cer", 
-                    "../ssl/test/axTLS.device_key",
+                    "-cipher RC4-SHA",
+                    "../ssl/test/axTLS.x509_1024.cer", NULL, 
+                    "../ssl/test/axTLS.key_1024",
                     NULL, NULL, DEFAULT_SVR_OPTION)))
         goto cleanup;
 
+    /* 
+     * 1042 bit RSA key (check certificate chaining)
+     */
+    if ((ret = SSL_server_test("1042 bit key", 
+                    "-cipher RC4-SHA",
+                    "../ssl/test/axTLS.x509_1042.cer", NULL, 
+                    "../ssl/test/axTLS.key_1042",
+                    NULL, NULL, DEFAULT_SVR_OPTION)))
+        goto cleanup;
     /* 
      * 2048 bit RSA key 
      */
@@ -1024,7 +1088,6 @@ int SSL_server_tests(void)
 
         printf("SSL server test \"%s\" passed\n", "Bad Before Cert");
         TTY_FLUSH();
-        ret = 0;    /* is ok */
     }
 
     /* this test should fail */
@@ -1306,8 +1369,8 @@ static int SSL_client_test(
             }
         }
 
-	if (ssl_obj_load(*ssl_ctx, SSL_OBJ_X509_CACERT, 
-				"../ssl/test/axTLS.ca_x509.cer", NULL))
+        if (ssl_obj_load(*ssl_ctx, SSL_OBJ_X509_CACERT, 
+                "../ssl/test/axTLS.ca_x509.cer", NULL))
         {
             printf("could not add cert auth\n"); TTY_FLUSH();
             goto client_test_exit;
@@ -1334,8 +1397,12 @@ static int SSL_client_test(
     /* renegotiate client */
     if (sess_resume && sess_resume->do_reneg) 
     {
-        if (ssl_renegotiate(ssl) < 0)
-            goto client_test_exit;
+        if (ssl_renegotiate(ssl) == -SSL_ALERT_NO_RENEGOTIATION) 
+            ret = 0;
+        else
+            ret = -SSL_ALERT_NO_RENEGOTIATION;
+
+        goto client_test_exit;
     }
 
     if (sess_resume)
@@ -1378,9 +1445,6 @@ client_test_exit:
         {
             ssl_ctx_free(*ssl_ctx);
             *ssl_ctx = NULL;
-#ifndef WIN32
-            pthread_cancel(sess_resume->server_thread);
-#endif
         }
         else if (sess_resume->start_server)
         {
@@ -1393,9 +1457,6 @@ client_test_exit:
     {
         ssl_ctx_free(*ssl_ctx);
         *ssl_ctx = NULL;
-#ifndef WIN32
-        pthread_cancel(thread);
-#endif
     }
 
     if (ret == 0)
@@ -1431,7 +1492,9 @@ int SSL_client_tests(void)
                     DEFAULT_CLNT_OPTION, NULL, NULL, NULL)))
         goto cleanup;
 
+    // no client renegotiation
     sess_resume.do_reneg = 1;
+    // test relies on openssl killing the call
     if ((ret = SSL_client_test("Client renegotiation", 
                     &ssl_ctx, NULL, &sess_resume, 
                     DEFAULT_CLNT_OPTION, NULL, NULL, NULL)))
@@ -1507,11 +1570,28 @@ int SSL_client_tests(void)
                     DEFAULT_CLNT_OPTION|SSL_SERVER_VERIFY_LATER, NULL, 
                     NULL, NULL)) != SSL_X509_ERROR(X509_VFY_ERROR_EXPIRED))
     {
-        printf("*** Error: %d\n", ret);
+        printf("*** Error: %d\n", ret); TTY_FLUSH();
         goto cleanup;
     }
 
     printf("SSL client test \"Expired cert (verify later)\" passed\n");
+
+    /* invalid cert type */
+    if ((ret = SSL_client_test("Error: Invalid certificate type", 
+                    &ssl_ctx,
+                    "-cert ../ssl/test/axTLS.x509_2048.pem "
+                    "-key ../ssl/test/axTLS.key_2048.pem "
+                    "-CAfile ../ssl/test/axTLS.ca_x509.pem "
+                    "-verify 1 ", NULL, DEFAULT_CLNT_OPTION, 
+                    "../ssl/test/axTLS.x509_1024.cer", NULL,
+                    "../ssl/test/axTLS.x509_1024.cer")) 
+                            != SSL_ERROR_INVALID_KEY)
+    {
+        printf("*** Error: %d\n", ret); TTY_FLUSH();
+        goto cleanup;
+    }
+
+    printf("SSL client test \"Invalid certificate type\" passed\n");
     ret = 0;
 
 cleanup:
@@ -1519,6 +1599,7 @@ cleanup:
     {
         ssl_display_error(ret);
         printf("Error: A client test failed\n");
+        system("sh ../ssl/test/killopenssl.sh");
         exit(1);
     }
     else
@@ -1526,6 +1607,7 @@ cleanup:
         printf("All client tests passed\n"); TTY_FLUSH();
     }
 
+    ssl_ctx_free(ssl_ctx);
     return ret;
 }
 
@@ -1555,7 +1637,6 @@ static void do_basic(void)
     /* check the return status */
     if (ssl_handshake_status(ssl_clnt) < 0)
     {
-        printf("YA YA\n");
         ssl_display_error(ssl_handshake_status(ssl_clnt));
         goto error;
     }
@@ -1614,7 +1695,6 @@ static int SSL_basic_test(void)
 
         if (size < SSL_OK) /* got some alert or something nasty */
         {
-            printf("Server ");
             ssl_display_error(size);
             ret = size;
             break;
@@ -1634,6 +1714,133 @@ static int SSL_basic_test(void)
     printf(ret == SSL_OK && offset == sizeof(basic_buf) ? 
                             "SSL basic test passed\n" :
                             "SSL basic test failed\n");
+    TTY_FLUSH();
+
+    ssl_free(ssl_svr);
+    SOCKET_CLOSE(server_fd);
+    SOCKET_CLOSE(client_fd);
+
+error:
+    ssl_ctx_free(ssl_svr_ctx);
+    return ret;
+}
+
+/**************************************************************************
+ * SSL unblocked case
+ *
+ **************************************************************************/
+static void do_unblocked(void)
+{
+    int client_fd;
+    SSL *ssl_clnt;
+    SSL_CTX *ssl_clnt_ctx = ssl_ctx_new(
+                            DEFAULT_CLNT_OPTION, 
+                            SSL_DEFAULT_CLNT_SESS |
+                            SSL_CONNECT_IN_PARTS);
+    usleep(200000);           /* allow server to start */
+
+    if ((client_fd = client_socket_init(g_port)) < 0)
+        goto error;
+
+    {
+#ifdef WIN32
+        u_long argp = 1;
+        ioctlsocket(client_fd, FIONBIO, &argp);
+#else
+        int flags = fcntl(client_fd, F_GETFL, NULL);
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+    }
+
+    if (ssl_obj_load(ssl_clnt_ctx, SSL_OBJ_X509_CACERT, 
+                                        "../ssl/test/axTLS.ca_x509.cer", NULL))
+        goto error;
+
+    ssl_clnt = ssl_client_new(ssl_clnt_ctx, client_fd, NULL, 0);
+
+    while (ssl_handshake_status(ssl_clnt) != SSL_OK)
+    {
+        if (ssl_read(ssl_clnt, NULL) < 0)
+        {
+            ssl_display_error(ssl_handshake_status(ssl_clnt));
+            goto error;
+        }
+    }
+
+    ssl_write(ssl_clnt, basic_buf, sizeof(basic_buf));
+    ssl_free(ssl_clnt);
+
+error:
+    ssl_ctx_free(ssl_clnt_ctx);
+    SOCKET_CLOSE(client_fd);
+
+    /* exit this thread */
+}
+
+static int SSL_unblocked_test(void)
+{
+    int server_fd, client_fd, ret = 0, size = 0, offset = 0;
+    SSL_CTX *ssl_svr_ctx = NULL;
+    struct sockaddr_in client_addr;
+    uint8_t *read_buf;
+    socklen_t clnt_len = sizeof(client_addr);
+    SSL *ssl_svr;
+#ifndef WIN32
+    pthread_t thread;
+#endif
+    memset(basic_buf, 0xA5, sizeof(basic_buf)/2);
+    memset(&basic_buf[sizeof(basic_buf)/2], 0x5A, sizeof(basic_buf)/2);
+
+    if ((server_fd = server_socket_init(&g_port)) < 0)
+        goto error;
+
+    ssl_svr_ctx = ssl_ctx_new(DEFAULT_SVR_OPTION, SSL_DEFAULT_SVR_SESS);
+
+#ifndef WIN32
+    pthread_create(&thread, NULL, 
+                (void *(*)(void *))do_unblocked, NULL);
+    pthread_detach(thread);
+#else
+    CreateThread(NULL, 1024, (LPTHREAD_START_ROUTINE)do_unblocked, 
+                        NULL, 0, NULL);
+#endif
+
+    /* Wait for a client to connect */
+    if ((client_fd = accept(server_fd, 
+                    (struct sockaddr *) &client_addr, &clnt_len)) < 0)
+    {
+        ret = SSL_ERROR_SOCK_SETUP_FAILURE;
+        goto error;
+    }
+    
+    /* we are ready to go */
+    ssl_svr = ssl_server_new(ssl_svr_ctx, client_fd);
+    
+    do
+    {
+        while ((size = ssl_read(ssl_svr, &read_buf)) == SSL_OK);
+
+        if (size < SSL_OK) /* got some alert or something nasty */
+        {
+            ssl_display_error(size);
+            ret = size;
+            break;
+        }
+        else /* looks more promising */
+        {
+            if (memcmp(read_buf, &basic_buf[offset], size) != 0)
+            {
+                ret = SSL_NOT_OK;
+                break;
+            }
+        }
+
+        offset += size;
+    } while (offset < sizeof(basic_buf));
+
+    printf(ret == SSL_OK && offset == sizeof(basic_buf) ? 
+                            "SSL unblocked test passed\n" :
+                            "SSL unblocked test failed\n");
     TTY_FLUSH();
 
     ssl_free(ssl_svr);
@@ -1668,7 +1875,7 @@ void do_multi_clnt(multi_t *multi_data)
     if ((client_fd = client_socket_init(multi_data->port)) < 0)
         goto client_test_exit;
 
-    sleep(1);
+    usleep(200000);
     ssl = ssl_client_new(multi_data->ssl_clnt_ctx, client_fd, NULL, 0);
 
     if ((res = ssl_handshake_status(ssl)))
@@ -1951,6 +2158,11 @@ int main(int argc, char *argv[])
 #endif
 
     if (SSL_basic_test())
+        goto cleanup;
+
+    system("sh ../ssl/test/killopenssl.sh");
+
+    if (SSL_unblocked_test())
         goto cleanup;
 
     system("sh ../ssl/test/killopenssl.sh");

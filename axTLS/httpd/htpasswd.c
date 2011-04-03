@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007, Cameron Rich
+ * Copyright (c) Cameron Rich
  * 
  * All rights reserved.
  * 
@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "os_port.h"
 #include "ssl.h"
 
 int tfd;

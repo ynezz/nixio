@@ -50,6 +50,9 @@ target:
 ifdef CONFIG_AXHTTPD
 	$(MAKE) -C httpd
 endif
+ifdef CONFIG_AXTLSWRAP
+	$(MAKE) -C axtlswrap
+endif
 ifdef CONFIG_BINDINGS
 	$(MAKE) -C bindings
 endif
@@ -105,6 +108,7 @@ endif
 	install -m 644 ssl/*.h $(PREFIX)/include/axTLS
 	-rm $(PREFIX)/include/axTLS/cert.h
 	-rm $(PREFIX)/include/axTLS/private_key.h
+	-rm $(PREFIX)/include/axTLS/os_port.h
 	install -m 644 config/config.h $(PREFIX)/include/axTLS
 
 installclean:
@@ -121,6 +125,7 @@ clean::
 	@cd crypto; $(MAKE) clean
 	@cd ssl; $(MAKE) clean
 	@cd httpd; $(MAKE) clean
+	@cd axtlswrap; $(MAKE) clean
 	@cd samples; $(MAKE) clean
 	@cd docsrc; $(MAKE) clean
 	@cd bindings; $(MAKE) clean

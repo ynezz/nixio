@@ -46,6 +46,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "os_port.h"
 #include "ssl.h"
 
 /* define standard input */
@@ -310,7 +311,6 @@ static void do_server(int argc, char *argv[])
         if ((client_fd = accept(server_fd, 
                 (struct sockaddr *)&client_addr, &client_len)) < 0)
         {
-            res = 1;
             break;
         }
 
@@ -383,6 +383,11 @@ static void do_server(int argc, char *argv[])
                     if (res > SSL_OK)    /* display our interesting output */
                     {
                         printf("%s", read_buf);
+                        TTY_FLUSH();
+                    }
+                    else if (res == SSL_CLOSE_NOTIFY)
+                    {
+                        printf("shutting down SSL\n");
                         TTY_FLUSH();
                     }
                     else if (res < SSL_OK && !quiet)
@@ -678,7 +683,6 @@ static void do_client(int argc, char *argv[])
     for (;;)
     {
         uint8_t buf[1024];
-        res = SSL_OK;
 
         /* allow parallel reading of server and standard input */
         FD_SET(client_fd, &read_set);

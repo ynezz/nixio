@@ -32,7 +32,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
-
+#include "os_port.h"
 #include "ssl.h"
 
 #ifdef CONFIG_SSL_ENABLE_CLIENT        /* all commented out if no client */
@@ -50,11 +50,7 @@ static int send_cert_verify(SSL *ssl);
 EXP_FUNC SSL * STDCALL ssl_client_new(SSL_CTX *ssl_ctx, int client_fd, const
         uint8_t *session_id, uint8_t sess_id_size)
 {
-    SSL *ssl;
-    int ret;
-
-    SOCKET_BLOCK(client_fd);    /* ensure blocking mode */
-    ssl = ssl_new(ssl_ctx, client_fd);
+    SSL *ssl = ssl_new(ssl_ctx, client_fd);
 
     if (session_id && ssl_ctx->num_sessions)
     {
@@ -70,7 +66,7 @@ EXP_FUNC SSL * STDCALL ssl_client_new(SSL_CTX *ssl_ctx, int client_fd, const
     }
 
     SET_SSL_FLAG(SSL_IS_CLIENT);
-    ret = do_client_connect(ssl);
+    do_client_connect(ssl);
     return ssl;
 }
 
@@ -79,7 +75,7 @@ EXP_FUNC SSL * STDCALL ssl_client_new(SSL_CTX *ssl_ctx, int client_fd, const
  */
 int do_clnt_handshake(SSL *ssl, int handshake_type, uint8_t *buf, int hs_len)
 {
-    int ret = SSL_OK;
+    int ret;
 
     /* To get here the state must be valid */
     switch (handshake_type)
@@ -123,11 +119,16 @@ int do_clnt_handshake(SSL *ssl, int handshake_type, uint8_t *buf, int hs_len)
         case HS_FINISHED:
             ret = process_finished(ssl, hs_len);
             disposable_free(ssl);   /* free up some memory */
+            /* note: client renegotiation is not allowed after this */
             break;
 
         case HS_HELLO_REQUEST:
             disposable_new(ssl);
             ret = do_client_connect(ssl);
+            break;
+
+        default:
+            ret = SSL_ERROR_INVALID_HANDSHAKE;
             break;
     }
 
@@ -145,26 +146,16 @@ int do_client_connect(SSL *ssl)
     ssl->bm_read_index = 0;
     ssl->next_state = HS_SERVER_HELLO;
     ssl->hs_status = SSL_NOT_OK;            /* not connected */
-    x509_free(ssl->x509_ctx);
 
     /* sit in a loop until it all looks good */
-    while (ssl->hs_status != SSL_OK)
+    if (!IS_SET_SSL_FLAG(SSL_CONNECT_IN_PARTS))
     {
-        ret = basic_read(ssl, NULL);
-        
-        if (ret < SSL_OK)
-        { 
-            if (ret != SSL_ERROR_CONN_LOST)
-            {
-                /* let the server know we are dying and why */
-                if (send_alert(ssl, ret))
-                {
-                    /* something nasty happened, so get rid of it */
-                    kill_ssl_session(ssl->ssl_ctx->ssl_sessions, ssl);
-                }
-            }
-
-            break;
+        while (ssl->hs_status != SSL_OK)
+        {
+            ret = ssl_read(ssl, NULL);
+            
+            if (ret < SSL_OK)
+                break;
         }
     }
 
@@ -249,6 +240,12 @@ static int process_server_hello(SSL *ssl)
     memcpy(ssl->dc->server_random, &buf[6], SSL_RANDOM_SIZE);
     offset = 6 + SSL_RANDOM_SIZE; /* skip of session id size */
     sess_id_size = buf[offset++];
+
+    if (sess_id_size > SSL_SESSION_ID_SIZE)
+    {
+        ret = SSL_ERROR_INVALID_SESSION;
+        goto error;
+    }
 
     if (num_sessions)
     {
