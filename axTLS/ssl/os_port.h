@@ -148,6 +148,7 @@ EXP_FUNC int STDCALL getdomainname(char *buf, int buf_size);
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "config.h"
 
 #define SOCKET_READ(A,B,C)      read(A,B,C)
 #define SOCKET_WRITE(A,B,C)     write(A,B,C)
@@ -191,6 +192,7 @@ void exit_now(const char *format, ...);
 #define SSL_CTX_UNLOCK(A)           pthread_mutex_unlock(&A)
 #endif
 #else   /* no mutexing */
+#define SSL_CTX_MUTEX_TYPE          void*
 #define SSL_CTX_MUTEX_INIT(A)
 #define SSL_CTX_MUTEX_DESTROY(A)
 #define SSL_CTX_LOCK(A)

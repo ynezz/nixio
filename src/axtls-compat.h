@@ -37,6 +37,7 @@
  */
 
 #include "nixio.h"
+#include "os_port.h"
 #include "config.h"
 
 #define WITH_AXTLS						1
