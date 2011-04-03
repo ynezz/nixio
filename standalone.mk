@@ -1,9 +1,9 @@
-LUAC = luac
+LUAC ?= luac
 LUAC_OPTIONS = -s
 LUA_TARGET ?= source
 
-LUA_MODULEDIR = /usr/local/share/lua/5.1
-LUA_LIBRARYDIR = /usr/local/lib/lua/5.1
+LUA_MODULEDIR ?= /usr/local/share/lua/5.1
+LUA_LIBRARYDIR ?= /usr/local/lib/lua/5.1
 
 OS ?= $(shell uname)
 
@@ -11,10 +11,10 @@ LUA_SHLIBS = $(shell pkg-config --silence-errors --libs lua5.1 || pkg-config --s
 LUA_LIBS = $(if $(LUA_SHLIBS),$(LUA_SHLIBS),$(firstword $(wildcard /usr/lib/liblua.a /usr/local/lib/liblua.a /opt/local/lib/liblua.a)))
 LUA_CFLAGS = $(shell pkg-config --silence-errors --cflags lua5.1 || pkg-config --silence-errors --cflags lua-5.1 || pkg-config --silence-errors --cflags lua)
 
-CC = gcc
-AR = ar
-RANLIB = ranlib
-CFLAGS = -O2
+CC ?= gcc
+AR ?= ar
+RANLIB ?= ranlib
+CFLAGS ?= -O2
 FPIC = -fPIC
 EXTRA_CFLAGS = --std=gnu99
 WFLAGS = -Wall -Werror -pedantic
